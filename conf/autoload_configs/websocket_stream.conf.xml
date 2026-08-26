@@ -1,0 +1,61 @@
+<configuration name="websocket_stream.conf" description="WebSocket Stream">
+  <settings>
+    <!--
+      WebSocket PCM sample rate in Hz. Any integer from 8000 through 48000 is
+      accepted. Default: 16000.
+      <param name="sample-rate" value="16000"/>
+    -->
+
+    <!--
+      Audio FreeSWITCH sends to the WebSocket:
+        read   = audio arriving from the attached channel's remote side
+        write  = audio leaving FreeSWITCH toward that remote side
+        mixed  = read and write audio combined into mono
+        stereo = two-channel PCM: read on the left, write on the right
+      Default: read.
+      <param name="channel-to-websocket" value="read"/>
+    -->
+
+    <!--
+      Audio the WebSocket sends to the attached FreeSWITCH channel:
+        write = send it toward the channel's remote device or service
+        read  = treat it as arriving from that remote side, so a bridge,
+                conference, or other FreeSWITCH application receives it
+      Default: write.
+      <param name="websocket-to-channel" value="write"/>
+    -->
+
+    <!--
+      Retry unexpected connection failures while the channel remains active.
+      Delays double after each failure: 1s, 2s, 4s, 8s, then 16s with these
+      defaults. Set reconnect-attempts to 0 to disable reconnection. Normal
+      WebSocket closes and explicit stream stops are never reconnected.
+      Defaults: 5 attempts and a 1000 ms initial delay.
+      <param name="reconnect-attempts" value="5"/>
+      <param name="reconnect-delay-ms" value="1000"/>
+    -->
+
+    <!--
+      Emit per-stream statistics events at this interval. Set to 0 to disable
+      them. Default: 10000 ms.
+      <param name="statistics-interval-ms" value="10000"/>
+    -->
+
+    <!--
+      These limits can be raised or lowered. The status command shows how high
+      each one can go.
+      <param name="maximum-streams" value="256"/>
+      <param name="maximum-streams-per-channel" value="16"/>
+      <param name="maximum-http-headers" value="64"/>
+      <param name="maximum-http-header-bytes" value="32768"/>
+      <param name="maximum-start-variables" value="256"/>
+      <param name="maximum-start-variable-bytes" value="32768"/>
+      <param name="maximum-start-message-bytes" value="65536"/>
+      <param name="maximum-api-response-bytes" value="65536"/>
+      Header and start-variable names remain limited to 256 bytes. Their values
+      remain limited to 4096 bytes. API responses must allow at least 256 bytes.
+    -->
+  </settings>
+
+  <headers/>
+</configuration>
