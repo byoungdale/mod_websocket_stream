@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(mod_websocket_stream VERSION 0.0.1 LANGUAGES C)
+project(mod_websocket_stream VERSION 0.0.2 LANGUAGES C)
 
 include(CTest)
 

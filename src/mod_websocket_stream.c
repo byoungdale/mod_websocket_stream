@@ -126,6 +126,8 @@
 	 MWS_HARD_MAXIMUM_STREAMS + 1U)
 #define MWS_WORKER_POLL_INTERVAL_US 10000
 #define MWS_WORKER_ACK_POLL_INTERVAL_US 100000
+#define MWS_AUTOMATIC_MAXIMUM_TRANSPORT_WORKERS 8U
+#define MWS_HARD_MAXIMUM_TRANSPORT_WORKERS 32U
 #define MWS_CONNECT_TIMEOUT_MS 5000L
 #define MWS_CLOSE_HANDSHAKE_TIMEOUT_US 500000
 #define MWS_DEFAULT_RECONNECT_ATTEMPTS 5
@@ -162,9 +164,13 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_websocket_stream_shutdown);
 
 typedef struct mws_stream_s mws_stream_t;
 typedef struct mws_channel_s mws_channel_t;
+typedef struct mws_transport_worker_s mws_transport_worker_t;
 
-static switch_status_t stop_transport_worker(void);
-static void stop_transport_worker_for_lifetime_safety(void);
+static switch_status_t stop_transport_workers(void);
+static switch_status_t stop_transport_worker(mws_transport_worker_t *worker);
+static void stop_transport_worker_for_lifetime_safety(
+		mws_transport_worker_t *worker,
+		switch_bool_t cleanup_streams);
 static switch_status_t stop_api_command_worker(void);
 static switch_status_t stop_cleanup_worker(void);
 static uint32_t calculate_reconnect_delay_ms(mws_stream_t *stream_context);
@@ -239,6 +245,22 @@ typedef struct {
 	mws_worker_command_type_t type;
 	mws_stream_t *stream_context;
 } mws_worker_command_t;
+
+struct mws_transport_worker_s {
+	uint32_t index;
+	switch_mutex_t *mutex;
+	switch_mutex_t *shutdown_mutex;
+	switch_queue_t *commands;
+	switch_thread_t *thread;
+	CURLM *multi;
+	mws_worker_command_t stop_command;
+	switch_bool_t running;
+	switch_bool_t stopping;
+	switch_bool_t stop_queued;
+	switch_bool_t cleanup_streams_on_stop;
+	uint32_t regular_commands_queued;
+	uint32_t assigned_streams;
+};
 
 typedef struct {
 	char session_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
@@ -376,6 +398,8 @@ struct mws_stream_s {
 	_Atomic uint64_t playback_format_change_count;
 	switch_mutex_t *worker_state_mutex;
 	switch_thread_cond_t *worker_state_condition;
+	mws_transport_worker_t *transport_worker;
+	switch_bool_t worker_assignment_counted;
 	switch_bool_t worker_add_queued;
 	switch_bool_t worker_remove_queued;
 	switch_bool_t worker_attached;
@@ -481,14 +505,11 @@ static struct {
 	switch_mutex_t *config_mutex;
 	switch_mutex_t *streams_mutex;
 	switch_mutex_t *worker_mutex;
-	switch_mutex_t *worker_shutdown_mutex;
-	switch_queue_t *worker_commands;
-	switch_thread_t *worker_thread;
-	mws_worker_command_t worker_stop_command;
-	switch_bool_t worker_running;
-	switch_bool_t worker_stopping;
-	switch_bool_t worker_stop_queued;
-	uint32_t regular_worker_commands_queued;
+	switch_mutex_t *transport_assignment_mutex;
+	mws_transport_worker_t *transport_workers;
+	uint32_t transport_worker_count;
+	uint32_t next_transport_worker;
+	switch_bool_t transport_workers_stopping;
 	switch_mutex_t *api_command_worker_mutex;
 	switch_queue_t *api_command_tasks;
 	switch_thread_t *api_command_worker_thread;
@@ -545,6 +566,7 @@ static struct {
 	mws_http_header_t *configured_headers;
 	uint32_t configured_header_count;
 	int statistics_interval_ms;
+	int configured_transport_workers;
 } globals;
 
 static switch_xml_config_enum_item_t channel_to_websocket_options[] = {
@@ -587,6 +609,13 @@ static switch_xml_config_int_options_t reconnect_delay_options = {
 	MWS_MINIMUM_RECONNECT_DELAY_MS,
 	SWITCH_TRUE,
 	MWS_MAXIMUM_RECONNECT_DELAY_MS
+};
+
+static switch_xml_config_int_options_t transport_worker_options = {
+	SWITCH_TRUE,
+	0,
+	SWITCH_TRUE,
+	MWS_HARD_MAXIMUM_TRANSPORT_WORKERS
 };
 
 #define MWS_LIMIT_OPTIONS(name, minimum, maximum) \
@@ -690,6 +719,16 @@ static switch_xml_config_item_t config_instructions[] = {
 			"Interval for per-stream statistics events; 0 disables them "
 			"(default: 10000)."),
 	SWITCH_CONFIG_ITEM(
+			"transport-workers",
+			SWITCH_CONFIG_INT,
+			0,
+			&globals.configured_transport_workers,
+			(void *) 0,
+			&transport_worker_options,
+			"<integer-workers>",
+			"Transport worker threads. 0 selects half the detected CPUs, "
+			"capped at 8. This setting requires a module reload (default: 0)."),
+	SWITCH_CONFIG_ITEM(
 			"maximum-streams",
 			SWITCH_CONFIG_INT,
 			CONFIG_RELOADABLE,
@@ -771,6 +810,7 @@ typedef struct {
 	int reconnect_attempts;
 	int reconnect_delay_ms;
 	int statistics_interval_ms;
+	int configured_transport_workers;
 	int maximum_streams;
 	int maximum_streams_per_channel;
 	int maximum_http_headers;
@@ -789,6 +829,8 @@ static void snapshot_config_locked(mws_config_snapshot_t *snapshot)
 	snapshot->reconnect_attempts = globals.reconnect_attempts;
 	snapshot->reconnect_delay_ms = globals.reconnect_delay_ms;
 	snapshot->statistics_interval_ms = globals.statistics_interval_ms;
+	snapshot->configured_transport_workers =
+			globals.configured_transport_workers;
 	snapshot->maximum_streams = globals.maximum_streams;
 	snapshot->maximum_streams_per_channel =
 			globals.maximum_streams_per_channel;
@@ -810,6 +852,8 @@ static void restore_config_locked(const mws_config_snapshot_t *snapshot)
 	globals.reconnect_attempts = snapshot->reconnect_attempts;
 	globals.reconnect_delay_ms = snapshot->reconnect_delay_ms;
 	globals.statistics_interval_ms = snapshot->statistics_interval_ms;
+	globals.configured_transport_workers =
+			snapshot->configured_transport_workers;
 	globals.maximum_streams = snapshot->maximum_streams;
 	globals.maximum_streams_per_channel =
 			snapshot->maximum_streams_per_channel;
@@ -1589,36 +1633,107 @@ static void worker_acknowledge_add(mws_stream_t *stream_context)
 	switch_mutex_unlock(stream_context->worker_state_mutex);
 }
 
+static switch_bool_t worker_claim_assignment_locked(
+		mws_stream_t *stream_context)
+{
+	switch_bool_t claimed = stream_context->worker_assignment_counted;
+
+	stream_context->worker_assignment_counted = SWITCH_FALSE;
+
+	return claimed;
+}
+
 static void worker_acknowledge_remove(mws_stream_t *stream_context)
 {
+	mws_transport_worker_t *worker;
+	switch_bool_t release_assignment;
+
 	switch_mutex_lock(stream_context->worker_state_mutex);
 	stream_context->worker_attached = SWITCH_FALSE;
 	stream_context->worker_remove_queued = SWITCH_FALSE;
 	stream_context->worker_removed = SWITCH_TRUE;
+	worker = stream_context->transport_worker;
+	release_assignment = worker_claim_assignment_locked(stream_context);
 	switch_thread_cond_broadcast(stream_context->worker_state_condition);
 	switch_mutex_unlock(stream_context->worker_state_mutex);
+
+	if (worker && release_assignment) {
+		switch_mutex_lock(worker->mutex);
+		switch_assert(worker->assigned_streams > 0);
+		worker->assigned_streams--;
+		switch_mutex_unlock(worker->mutex);
+	}
 }
 
-static switch_bool_t transport_worker_is_running(void)
+static switch_bool_t transport_worker_is_running(
+		mws_transport_worker_t *worker)
 {
 	switch_bool_t running;
 
-	switch_mutex_lock(globals.worker_mutex);
-	running = globals.worker_running;
-	switch_mutex_unlock(globals.worker_mutex);
+	switch_mutex_lock(worker->mutex);
+	running = worker->running;
+	switch_mutex_unlock(worker->mutex);
 
 	return running;
 }
 
-static switch_bool_t transport_worker_accepts_streams(void)
+static mws_transport_worker_t *reserve_transport_worker(void)
 {
-	switch_bool_t accepting;
+	mws_transport_worker_t *selected_worker = NULL;
+	uint32_t selected_load = UINT32_MAX;
+	uint32_t start;
+	uint32_t offset;
 
-	switch_mutex_lock(globals.worker_mutex);
-	accepting = globals.worker_running && !globals.worker_stopping;
-	switch_mutex_unlock(globals.worker_mutex);
+	switch_mutex_lock(globals.transport_assignment_mutex);
+	if (globals.transport_workers_stopping ||
+			!globals.transport_workers || !globals.transport_worker_count) {
+		switch_mutex_unlock(globals.transport_assignment_mutex);
+		return NULL;
+	}
 
-	return accepting;
+	start = globals.next_transport_worker++ % globals.transport_worker_count;
+	for (offset = 0; offset < globals.transport_worker_count; offset++) {
+		mws_transport_worker_t *worker = &globals.transport_workers[
+				(start + offset) % globals.transport_worker_count];
+
+		switch_mutex_lock(worker->mutex);
+		if (worker->running && !worker->stopping &&
+				worker->assigned_streams < selected_load) {
+			selected_worker = worker;
+			selected_load = worker->assigned_streams;
+		}
+		switch_mutex_unlock(worker->mutex);
+	}
+
+	if (selected_worker) {
+		switch_mutex_lock(selected_worker->mutex);
+		if (selected_worker->running && !selected_worker->stopping) {
+			selected_worker->assigned_streams++;
+		} else {
+			switch_mutex_unlock(selected_worker->mutex);
+			selected_worker = NULL;
+			goto selection_complete;
+		}
+		switch_mutex_unlock(selected_worker->mutex);
+	}
+
+selection_complete:
+	switch_mutex_unlock(globals.transport_assignment_mutex);
+
+	return selected_worker;
+}
+
+static void release_transport_worker_reservation(
+		mws_transport_worker_t *worker)
+{
+	if (!worker) {
+		return;
+	}
+
+	switch_mutex_lock(worker->mutex);
+	switch_assert(worker->assigned_streams > 0);
+	worker->assigned_streams--;
+	switch_mutex_unlock(worker->mutex);
 }
 
 static switch_bool_t worker_command_uses_regular_slot(
@@ -1647,19 +1762,22 @@ static switch_bool_t worker_command_is_known(
 }
 
 static void release_regular_worker_command_slot(
+		mws_transport_worker_t *worker,
 		const mws_worker_command_t *command)
 {
 	if (!worker_command_uses_regular_slot(command)) {
 		return;
 	}
 
-	switch_mutex_lock(globals.worker_mutex);
-	switch_assert(globals.regular_worker_commands_queued > 0);
-	globals.regular_worker_commands_queued--;
-	switch_mutex_unlock(globals.worker_mutex);
+	switch_mutex_lock(worker->mutex);
+	switch_assert(worker->regular_commands_queued > 0);
+	worker->regular_commands_queued--;
+	switch_mutex_unlock(worker->mutex);
 }
 
-static switch_status_t push_worker_command(mws_worker_command_t *command)
+static switch_status_t push_worker_command(
+		mws_transport_worker_t *worker,
+		mws_worker_command_t *command)
 {
 	switch_bool_t regular = worker_command_uses_regular_slot(command);
 	switch_status_t status = SWITCH_STATUS_FALSE;
@@ -1668,24 +1786,30 @@ static switch_status_t push_worker_command(mws_worker_command_t *command)
 		return SWITCH_STATUS_FALSE;
 	}
 
-	switch_mutex_lock(globals.worker_mutex);
-	if (command->type == MWS_WORKER_COMMAND_STOP &&
-			globals.worker_stop_queued) {
+	switch_mutex_lock(worker->mutex);
+	if (!worker->running) {
+		status = SWITCH_STATUS_FALSE;
+	} else if (worker->stopping &&
+			command->type != MWS_WORKER_COMMAND_REMOVE &&
+			command->type != MWS_WORKER_COMMAND_STOP) {
+		status = SWITCH_STATUS_FALSE;
+	} else if (command->type == MWS_WORKER_COMMAND_STOP &&
+			worker->stop_queued) {
 		status = SWITCH_STATUS_SUCCESS;
-	} else if (!regular || globals.regular_worker_commands_queued <
+	} else if (!regular || worker->regular_commands_queued <
 			MWS_MAXIMUM_QUEUED_REGULAR_WORKER_COMMANDS) {
 		if (regular) {
-			globals.regular_worker_commands_queued++;
+			worker->regular_commands_queued++;
 		}
-		status = switch_queue_trypush(globals.worker_commands, command);
+		status = switch_queue_trypush(worker->commands, command);
 		if (status != SWITCH_STATUS_SUCCESS && regular) {
-			globals.regular_worker_commands_queued--;
+			worker->regular_commands_queued--;
 		} else if (status == SWITCH_STATUS_SUCCESS &&
 				command->type == MWS_WORKER_COMMAND_STOP) {
-			globals.worker_stop_queued = SWITCH_TRUE;
+			worker->stop_queued = SWITCH_TRUE;
 		}
 	}
-	switch_mutex_unlock(globals.worker_mutex);
+	switch_mutex_unlock(worker->mutex);
 
 	return status;
 }
@@ -5776,9 +5900,11 @@ static void *SWITCH_THREAD_FUNC websocket_stream_worker(
 		switch_thread_t *thread,
 		void *data)
 {
-	CURLM *multi = (CURLM *) data;
+	mws_transport_worker_t *worker = (mws_transport_worker_t *) data;
+	CURLM *multi = worker->multi;
 	mws_stream_t *worker_streams = NULL;
 	switch_bool_t running = SWITCH_TRUE;
+	switch_bool_t cleanup_streams = SWITCH_FALSE;
 
 	(void) thread;
 
@@ -5789,18 +5915,18 @@ static void *SWITCH_THREAD_FUNC websocket_stream_worker(
 
 		if (worker_streams) {
 			status = switch_queue_pop_timeout(
-					globals.worker_commands,
+					worker->commands,
 					&queue_data,
 					MWS_WORKER_POLL_INTERVAL_US);
 		} else {
 			status = switch_queue_pop(
-					globals.worker_commands,
+					worker->commands,
 					&queue_data);
 		}
 
 		if (status == SWITCH_STATUS_SUCCESS && queue_data) {
 			command = (mws_worker_command_t *) queue_data;
-			release_regular_worker_command_slot(command);
+			release_regular_worker_command_slot(worker, command);
 
 			switch (command->type) {
 			case MWS_WORKER_COMMAND_ADD:
@@ -5814,6 +5940,7 @@ static void *SWITCH_THREAD_FUNC websocket_stream_worker(
 						multi,
 						&worker_streams,
 						command->stream_context)) {
+					cleanup_streams = SWITCH_TRUE;
 					running = SWITCH_FALSE;
 				}
 				break;
@@ -5847,6 +5974,7 @@ static void *SWITCH_THREAD_FUNC websocket_stream_worker(
 			worker_start_due_reconnects(multi, worker_streams);
 
 			if (!worker_drive_transports(multi, worker_streams)) {
+				cleanup_streams = SWITCH_TRUE;
 				running = SWITCH_FALSE;
 				continue;
 			}
@@ -5859,6 +5987,7 @@ static void *SWITCH_THREAD_FUNC websocket_stream_worker(
 							multi,
 							stream_context,
 							CURLE_WRITE_ERROR)) {
+					cleanup_streams = SWITCH_TRUE;
 					running = SWITCH_FALSE;
 					break;
 				}
@@ -5870,6 +5999,7 @@ static void *SWITCH_THREAD_FUNC websocket_stream_worker(
 			for (stream_context = worker_streams; stream_context;
 					stream_context = stream_context->worker_next) {
 				if (!worker_resume_stream(multi, stream_context)) {
+					cleanup_streams = SWITCH_TRUE;
 					running = SWITCH_FALSE;
 					break;
 				}
@@ -5881,28 +6011,48 @@ static void *SWITCH_THREAD_FUNC websocket_stream_worker(
 			if (running && !worker_expire_peer_close_handshakes(
 					multi,
 					worker_streams)) {
+				cleanup_streams = SWITCH_TRUE;
 				running = SWITCH_FALSE;
 			}
 
 			if (running && !worker_finish_pending_stream_removals(
 					multi,
 					&worker_streams)) {
+				cleanup_streams = SWITCH_TRUE;
 				running = SWITCH_FALSE;
 			}
 		}
 	}
+
+	switch_mutex_lock(worker->mutex);
+	if (worker->cleanup_streams_on_stop) {
+		cleanup_streams = SWITCH_TRUE;
+	}
+	worker->stopping = SWITCH_TRUE;
+	switch_mutex_unlock(worker->mutex);
 
 	{
 		mws_stream_t *stream_context;
 
 		for (stream_context = worker_streams; stream_context;
 				stream_context = stream_context->worker_next) {
+			if (cleanup_streams) {
+				stream_context->transport_terminal_state =
+						MWS_TRANSPORT_FAILED;
+				worker_set_transport_state(
+						stream_context,
+						MWS_TRANSPORT_FAILED);
+				worker_request_automatic_stream_cleanup(
+						stream_context,
+						"WebSocket transport worker stopped unexpectedly");
+			}
 			worker_reset_pcm_state(stream_context);
 			(void) worker_cleanup_easy(multi, stream_context);
 		}
 	}
 
 	curl_multi_cleanup(multi);
+	worker->multi = NULL;
 
 	while (worker_streams) {
 		mws_stream_t *stream_context = worker_streams;
@@ -5918,47 +6068,53 @@ static void *SWITCH_THREAD_FUNC websocket_stream_worker(
 			stream_context->receive_paused = SWITCH_FALSE;
 			stream_context->receive_pause_required_bytes = 0;
 		}
-		if (stream_context->transport_terminal_state == MWS_TRANSPORT_NEW) {
+		if (!cleanup_streams &&
+				stream_context->transport_terminal_state == MWS_TRANSPORT_NEW) {
 			stream_context->transport_terminal_state = MWS_TRANSPORT_CLOSED;
 		}
-		worker_set_transport_state(
-				stream_context,
-				MWS_TRANSPORT_CLOSED);
+		if (!cleanup_streams) {
+			worker_set_transport_state(
+					stream_context,
+					MWS_TRANSPORT_CLOSED);
+		}
 		worker_streams = stream_context->worker_next;
 		stream_context->worker_next = NULL;
 		worker_acknowledge_remove(stream_context);
 	}
 
-	switch_mutex_lock(globals.worker_mutex);
-	globals.worker_running = SWITCH_FALSE;
-	globals.worker_stopping = SWITCH_TRUE;
-	switch_mutex_unlock(globals.worker_mutex);
+	switch_mutex_lock(worker->mutex);
+	worker->running = SWITCH_FALSE;
+	worker->stopping = SWITCH_TRUE;
+	switch_mutex_unlock(worker->mutex);
 
 	return NULL;
 }
 
-static switch_status_t start_transport_worker(switch_memory_pool_t *pool)
+static switch_status_t start_transport_worker(
+		mws_transport_worker_t *worker,
+		uint32_t index,
+		switch_memory_pool_t *pool)
 {
 	CURLM *multi;
 	switch_threadattr_t *thread_attributes;
 	switch_status_t status;
 
 	if (switch_mutex_init(
-				&globals.worker_mutex,
+				&worker->mutex,
 				SWITCH_MUTEX_UNNESTED,
 				pool) != SWITCH_STATUS_SUCCESS) {
 		return SWITCH_STATUS_FALSE;
 	}
 
 	if (switch_mutex_init(
-				&globals.worker_shutdown_mutex,
+				&worker->shutdown_mutex,
 				SWITCH_MUTEX_UNNESTED,
 				pool) != SWITCH_STATUS_SUCCESS) {
 		return SWITCH_STATUS_FALSE;
 	}
 
 	if (switch_queue_create(
-				&globals.worker_commands,
+				&worker->commands,
 				MWS_WORKER_COMMAND_QUEUE_CAPACITY,
 				pool) != SWITCH_STATUS_SUCCESS) {
 		return SWITCH_STATUS_FALSE;
@@ -5979,43 +6135,121 @@ static switch_status_t start_transport_worker(switch_memory_pool_t *pool)
 			thread_attributes,
 			SWITCH_THREAD_STACKSIZE);
 
-	globals.worker_stop_command.type = MWS_WORKER_COMMAND_STOP;
-	globals.worker_stop_command.stream_context = NULL;
+	worker->multi = multi;
+	worker->index = index;
+	worker->stop_command.type = MWS_WORKER_COMMAND_STOP;
+	worker->stop_command.stream_context = NULL;
+	switch_mutex_lock(worker->mutex);
+	worker->running = SWITCH_TRUE;
+	worker->stopping = SWITCH_FALSE;
+	worker->stop_queued = SWITCH_FALSE;
+	worker->cleanup_streams_on_stop = SWITCH_FALSE;
+	worker->regular_commands_queued = 0;
+	worker->assigned_streams = 0;
+	switch_mutex_unlock(worker->mutex);
+
+	status = switch_thread_create(
+			&worker->thread,
+			thread_attributes,
+			websocket_stream_worker,
+			worker,
+			pool);
+
+	if (status != SWITCH_STATUS_SUCCESS) {
+		curl_multi_cleanup(multi);
+		worker->multi = NULL;
+		switch_mutex_lock(worker->mutex);
+		worker->running = SWITCH_FALSE;
+		worker->stopping = SWITCH_TRUE;
+		worker->thread = NULL;
+		switch_mutex_unlock(worker->mutex);
+	}
+
+	return status;
+}
+
+static uint32_t configured_transport_worker_count(void)
+{
+	uint32_t cpu_count;
+	uint32_t worker_count;
+
+	if (globals.configured_transport_workers > 0) {
+		return (uint32_t) globals.configured_transport_workers;
+	}
+
+	cpu_count = switch_core_cpu_count();
+	worker_count = cpu_count / 2U;
+	if (!worker_count) {
+		worker_count = 1;
+	}
+	if (worker_count > MWS_AUTOMATIC_MAXIMUM_TRANSPORT_WORKERS) {
+		worker_count = MWS_AUTOMATIC_MAXIMUM_TRANSPORT_WORKERS;
+	}
+
+	return worker_count;
+}
+
+static switch_status_t start_transport_workers(switch_memory_pool_t *pool)
+{
+	uint32_t worker_count = configured_transport_worker_count();
+	uint32_t index;
+
+	if (switch_mutex_init(
+				&globals.worker_mutex,
+				SWITCH_MUTEX_UNNESTED,
+				pool) != SWITCH_STATUS_SUCCESS ||
+			switch_mutex_init(
+				&globals.transport_assignment_mutex,
+				SWITCH_MUTEX_UNNESTED,
+				pool) != SWITCH_STATUS_SUCCESS) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	globals.transport_workers = switch_core_alloc(
+			pool,
+			sizeof(*globals.transport_workers) * worker_count);
+	if (!globals.transport_workers) {
+		return SWITCH_STATUS_MEMERR;
+	}
+	globals.transport_worker_count = worker_count;
+	globals.next_transport_worker = 0;
+	globals.transport_workers_stopping = SWITCH_FALSE;
+
 	switch_mutex_lock(globals.worker_mutex);
-	globals.worker_running = SWITCH_TRUE;
-	globals.worker_stopping = SWITCH_FALSE;
-	globals.worker_stop_queued = SWITCH_FALSE;
-	globals.regular_worker_commands_queued = 0;
 	globals.connecting_streams = 0;
 	globals.open_streams = 0;
 	globals.reconnecting_streams = 0;
 	globals.failed_streams = 0;
 	switch_mutex_unlock(globals.worker_mutex);
 
-	status = switch_thread_create(
-			&globals.worker_thread,
-			thread_attributes,
-			websocket_stream_worker,
-			multi,
-			pool);
+	for (index = 0; index < worker_count; index++) {
+		if (start_transport_worker(
+				&globals.transport_workers[index],
+				index,
+				pool) != SWITCH_STATUS_SUCCESS) {
+			uint32_t started;
 
-	if (status != SWITCH_STATUS_SUCCESS) {
-		curl_multi_cleanup(multi);
-		switch_mutex_lock(globals.worker_mutex);
-		globals.worker_running = SWITCH_FALSE;
-		globals.worker_stopping = SWITCH_TRUE;
-		globals.worker_thread = NULL;
-		switch_mutex_unlock(globals.worker_mutex);
+			switch_mutex_lock(globals.transport_assignment_mutex);
+			globals.transport_workers_stopping = SWITCH_TRUE;
+			switch_mutex_unlock(globals.transport_assignment_mutex);
+			for (started = 0; started < index; started++) {
+				stop_transport_worker_for_lifetime_safety(
+						&globals.transport_workers[started],
+						SWITCH_FALSE);
+			}
+			return SWITCH_STATUS_FALSE;
+		}
 	}
 
-	return status;
+	return SWITCH_STATUS_SUCCESS;
 }
 
 static switch_status_t start_stream_worker(mws_stream_t *stream_context)
 {
+	mws_transport_worker_t *worker = reserve_transport_worker();
 	switch_status_t status;
 
-	if (!transport_worker_accepts_streams()) {
+	if (!worker) {
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -6024,19 +6258,24 @@ static switch_status_t start_stream_worker(mws_stream_t *stream_context)
 			&stream_context->shutdown_requested,
 			memory_order_acquire)) {
 		switch_mutex_unlock(stream_context->worker_state_mutex);
+		release_transport_worker_reservation(worker);
 		return SWITCH_STATUS_FALSE;
 	}
 	stream_context->worker_add_queued = SWITCH_TRUE;
 	stream_context->worker_remove_queued = SWITCH_FALSE;
 	stream_context->worker_attached = SWITCH_FALSE;
 	stream_context->worker_removed = SWITCH_FALSE;
+	stream_context->transport_worker = worker;
+	stream_context->worker_assignment_counted = SWITCH_TRUE;
 	switch_mutex_unlock(stream_context->worker_state_mutex);
 
-	status = push_worker_command(&stream_context->worker_add_command);
+	status = push_worker_command(worker, &stream_context->worker_add_command);
 	if (status != SWITCH_STATUS_SUCCESS) {
 		switch_mutex_lock(stream_context->worker_state_mutex);
 		stream_context->worker_add_queued = SWITCH_FALSE;
+		stream_context->worker_assignment_counted = SWITCH_FALSE;
 		switch_mutex_unlock(stream_context->worker_state_mutex);
+		release_transport_worker_reservation(worker);
 		return status;
 	}
 
@@ -6050,10 +6289,24 @@ static switch_status_t start_stream_worker(mws_stream_t *stream_context)
 				stream_context->worker_state_condition,
 				stream_context->worker_state_mutex,
 				MWS_WORKER_ACK_POLL_INTERVAL_US);
-		if (!transport_worker_is_running()) {
+		if (stream_context->worker_attached ||
+				stream_context->worker_removed ||
+				atomic_load_explicit(
+						&stream_context->shutdown_requested,
+						memory_order_acquire)) {
+			continue;
+		}
+		if (!transport_worker_is_running(worker)) {
+			switch_bool_t release_assignment;
+
 			stream_context->worker_add_queued = SWITCH_FALSE;
 			stream_context->worker_removed = SWITCH_TRUE;
+			release_assignment =
+					worker_claim_assignment_locked(stream_context);
 			switch_mutex_unlock(stream_context->worker_state_mutex);
+			if (release_assignment) {
+				release_transport_worker_reservation(worker);
+			}
 			return SWITCH_STATUS_FALSE;
 		}
 	}
@@ -6072,6 +6325,7 @@ static switch_status_t start_stream_worker(mws_stream_t *stream_context)
 static switch_status_t request_stream_worker_stop(
 		mws_stream_t *stream_context)
 {
+	mws_transport_worker_t *worker = stream_context->transport_worker;
 	switch_status_t status;
 
 	switch_mutex_lock(stream_context->api_command_mutex);
@@ -6088,14 +6342,18 @@ static switch_status_t request_stream_worker_stop(
 	stream_context->worker_remove_queued = SWITCH_TRUE;
 	switch_mutex_unlock(stream_context->worker_state_mutex);
 
-	status = push_worker_command(&stream_context->worker_remove_command);
+	if (!worker) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	status = push_worker_command(worker, &stream_context->worker_remove_command);
 	if (status != SWITCH_STATUS_SUCCESS) {
 		switch_mutex_lock(stream_context->worker_state_mutex);
 		stream_context->worker_remove_queued = SWITCH_FALSE;
 		switch_thread_cond_broadcast(stream_context->worker_state_condition);
 		switch_mutex_unlock(stream_context->worker_state_mutex);
 
-		stop_transport_worker_for_lifetime_safety();
+		stop_transport_worker_for_lifetime_safety(worker, SWITCH_TRUE);
 		return SWITCH_STATUS_SUCCESS;
 	}
 
@@ -6105,6 +6363,8 @@ static switch_status_t request_stream_worker_stop(
 static switch_status_t wait_for_stream_worker_stop(
 		mws_stream_t *stream_context)
 {
+	mws_transport_worker_t *worker = stream_context->transport_worker;
+	switch_bool_t release_assignment = SWITCH_FALSE;
 
 	switch_mutex_lock(stream_context->worker_state_mutex);
 	while (!stream_context->worker_removed) {
@@ -6112,13 +6372,18 @@ static switch_status_t wait_for_stream_worker_stop(
 				stream_context->worker_state_condition,
 				stream_context->worker_state_mutex,
 				MWS_WORKER_ACK_POLL_INTERVAL_US);
-		if (!transport_worker_is_running()) {
+		if (!worker || !transport_worker_is_running(worker)) {
 			stream_context->worker_attached = SWITCH_FALSE;
 			stream_context->worker_removed = SWITCH_TRUE;
+			release_assignment =
+					worker_claim_assignment_locked(stream_context);
 			break;
 		}
 	}
 	switch_mutex_unlock(stream_context->worker_state_mutex);
+	if (release_assignment) {
+		release_transport_worker_reservation(worker);
+	}
 
 	return SWITCH_STATUS_SUCCESS;
 }
@@ -6138,7 +6403,12 @@ static switch_status_t clear_stream_worker(
 		mws_stream_t *stream_context,
 		uint64_t *discarded_sample_count)
 {
+	mws_transport_worker_t *worker = stream_context->transport_worker;
 	switch_status_t status;
+
+	if (!worker) {
+		return SWITCH_STATUS_FALSE;
+	}
 
 	switch_mutex_lock(stream_context->worker_state_mutex);
 	if (atomic_load_explicit(
@@ -6152,7 +6422,7 @@ static switch_status_t clear_stream_worker(
 	stream_context->clear_command_complete = SWITCH_FALSE;
 	switch_mutex_unlock(stream_context->worker_state_mutex);
 
-	status = push_worker_command(&stream_context->worker_clear_command);
+	status = push_worker_command(worker, &stream_context->worker_clear_command);
 	if (status != SWITCH_STATUS_SUCCESS) {
 		switch_mutex_lock(stream_context->worker_state_mutex);
 		stream_context->clear_command_queued = SWITCH_FALSE;
@@ -6166,7 +6436,7 @@ static switch_status_t clear_stream_worker(
 				stream_context->worker_state_condition,
 				stream_context->worker_state_mutex,
 				MWS_WORKER_ACK_POLL_INTERVAL_US);
-		if (!transport_worker_is_running()) {
+		if (!transport_worker_is_running(worker)) {
 			stream_context->clear_command_queued = SWITCH_FALSE;
 			switch_mutex_unlock(stream_context->worker_state_mutex);
 			return SWITCH_STATUS_FALSE;
@@ -6183,50 +6453,99 @@ static switch_status_t clear_stream_worker(
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static switch_status_t stop_transport_worker(void)
+static switch_status_t stop_transport_worker(mws_transport_worker_t *worker)
 {
 	switch_thread_t *worker_thread;
 	switch_status_t thread_status = SWITCH_STATUS_SUCCESS;
 	switch_status_t status;
 
-	switch_mutex_lock(globals.worker_shutdown_mutex);
-	switch_mutex_lock(globals.worker_mutex);
-	worker_thread = globals.worker_thread;
+	switch_mutex_lock(worker->shutdown_mutex);
+	switch_mutex_lock(worker->mutex);
+	worker_thread = worker->thread;
 	if (!worker_thread) {
-		switch_mutex_unlock(globals.worker_mutex);
-		switch_mutex_unlock(globals.worker_shutdown_mutex);
+		switch_mutex_unlock(worker->mutex);
+		switch_mutex_unlock(worker->shutdown_mutex);
 		return SWITCH_STATUS_SUCCESS;
 	}
-	globals.worker_stopping = SWITCH_TRUE;
-	switch_mutex_unlock(globals.worker_mutex);
+	worker->stopping = SWITCH_TRUE;
+	switch_mutex_unlock(worker->mutex);
 
-	status = push_worker_command(&globals.worker_stop_command);
+	status = push_worker_command(worker, &worker->stop_command);
 	if (status != SWITCH_STATUS_SUCCESS) {
-		switch_queue_term(globals.worker_commands);
+		switch_queue_term(worker->commands);
 	}
 
 	status = switch_thread_join(&thread_status, worker_thread);
 
 	if (status != SWITCH_STATUS_SUCCESS) {
-		switch_mutex_unlock(globals.worker_shutdown_mutex);
+		switch_mutex_unlock(worker->shutdown_mutex);
 		return status;
 	}
 
-	switch_mutex_lock(globals.worker_mutex);
-	globals.worker_thread = NULL;
-	globals.worker_running = SWITCH_FALSE;
-	globals.worker_stop_queued = SWITCH_FALSE;
-	switch_mutex_unlock(globals.worker_mutex);
-	switch_mutex_unlock(globals.worker_shutdown_mutex);
+	switch_mutex_lock(worker->mutex);
+	worker->thread = NULL;
+	worker->running = SWITCH_FALSE;
+	worker->stop_queued = SWITCH_FALSE;
+	switch_mutex_unlock(worker->mutex);
+	switch_mutex_unlock(worker->shutdown_mutex);
 
 	return thread_status;
 }
 
-static void stop_transport_worker_for_lifetime_safety(void)
+static switch_status_t stop_transport_workers(void)
 {
-	while (transport_worker_is_running()) {
-		if (stop_transport_worker() != SWITCH_STATUS_SUCCESS &&
-				transport_worker_is_running()) {
+	switch_status_t result = SWITCH_STATUS_SUCCESS;
+	uint32_t index;
+
+	switch_mutex_lock(globals.transport_assignment_mutex);
+	globals.transport_workers_stopping = SWITCH_TRUE;
+	switch_mutex_unlock(globals.transport_assignment_mutex);
+
+	for (index = 0; index < globals.transport_worker_count; index++) {
+		mws_transport_worker_t *worker =
+				&globals.transport_workers[index];
+		switch_status_t status = stop_transport_worker(worker);
+
+		if (status != SWITCH_STATUS_SUCCESS &&
+				result == SWITCH_STATUS_SUCCESS) {
+			result = status;
+		}
+		if (status != SWITCH_STATUS_SUCCESS) {
+			stop_transport_worker_for_lifetime_safety(
+					worker,
+					SWITCH_FALSE);
+		}
+	}
+
+	return result;
+}
+
+static void stop_transport_worker_for_lifetime_safety(
+		mws_transport_worker_t *worker,
+		switch_bool_t cleanup_streams)
+{
+	if (cleanup_streams) {
+		switch_mutex_lock(worker->mutex);
+		worker->cleanup_streams_on_stop = SWITCH_TRUE;
+		switch_mutex_unlock(worker->mutex);
+	}
+
+	for (;;) {
+		switch_bool_t has_thread;
+
+		switch_mutex_lock(worker->mutex);
+		has_thread = worker->thread != NULL;
+		switch_mutex_unlock(worker->mutex);
+		if (!has_thread) {
+			break;
+		}
+
+		if (stop_transport_worker(worker) != SWITCH_STATUS_SUCCESS) {
+			switch_log_printf(
+					SWITCH_CHANNEL_LOG,
+					SWITCH_LOG_CRIT,
+					"Could not join WebSocket transport worker %u; retrying\n",
+					worker->index);
 			switch_yield(1000);
 		}
 	}
@@ -9108,6 +9427,7 @@ SWITCH_STANDARD_API(websocket_stream_api)
 	int reconnect_attempts;
 	int reconnect_delay_ms;
 	int statistics_interval_ms;
+	int configured_transport_workers;
 	int maximum_streams;
 	int maximum_streams_per_channel;
 	int maximum_http_headers;
@@ -9133,6 +9453,10 @@ SWITCH_STANDARD_API(websocket_stream_api)
 	uint64_t error_event_count;
 	uint64_t automatic_cleanup_request_count;
 	unsigned int worker_queue_size;
+	uint32_t transport_workers;
+	uint32_t transport_workers_running;
+	uint32_t transport_workers_used;
+	uint32_t transport_worker_max_streams;
 	unsigned int api_command_queue_size;
 	unsigned int cleanup_queue_size;
 	switch_bool_t worker_running;
@@ -9180,6 +9504,7 @@ SWITCH_STANDARD_API(websocket_stream_api)
 	reconnect_delay_ms = globals.reconnect_delay_ms;
 	configured_header_count = globals.configured_header_count;
 	statistics_interval_ms = globals.statistics_interval_ms;
+	configured_transport_workers = globals.configured_transport_workers;
 	maximum_streams = globals.maximum_streams;
 	maximum_streams_per_channel = globals.maximum_streams_per_channel;
 	maximum_http_headers = globals.maximum_http_headers;
@@ -9203,8 +9528,36 @@ SWITCH_STANDARD_API(websocket_stream_api)
 	reserved_streams = globals.reserved_streams;
 	switch_mutex_unlock(globals.streams_mutex);
 
+	transport_workers = globals.transport_worker_count;
+	transport_workers_running = 0;
+	transport_workers_used = 0;
+	transport_worker_max_streams = 0;
+	worker_queue_size = 0;
+	{
+		uint32_t index;
+
+		for (index = 0; index < transport_workers; index++) {
+			mws_transport_worker_t *worker =
+					&globals.transport_workers[index];
+			uint32_t assigned_streams;
+
+			switch_mutex_lock(worker->mutex);
+			if (worker->running) {
+				transport_workers_running++;
+			}
+			assigned_streams = worker->assigned_streams;
+			switch_mutex_unlock(worker->mutex);
+			if (assigned_streams) {
+				transport_workers_used++;
+			}
+			if (assigned_streams > transport_worker_max_streams) {
+				transport_worker_max_streams = assigned_streams;
+			}
+			worker_queue_size += switch_queue_size(worker->commands);
+		}
+	}
+	worker_running = transport_workers_running == transport_workers;
 	switch_mutex_lock(globals.worker_mutex);
-	worker_running = globals.worker_running;
 	connecting_streams = globals.connecting_streams;
 	open_streams = globals.open_streams;
 	reconnecting_streams = globals.reconnecting_streams;
@@ -9219,7 +9572,6 @@ SWITCH_STANDARD_API(websocket_stream_api)
 			globals.automatic_cleanup_request_count;
 	switch_mutex_unlock(globals.worker_mutex);
 
-	worker_queue_size = switch_queue_size(globals.worker_commands);
 	switch_mutex_lock(globals.api_command_worker_mutex);
 	api_command_worker_running = globals.api_command_worker_running;
 	switch_mutex_unlock(globals.api_command_worker_mutex);
@@ -9276,6 +9628,30 @@ SWITCH_STANDARD_API(websocket_stream_api)
 					document,
 					"statistics_interval_ms",
 					statistics_interval_ms) ||
+				!cJSON_AddNumberToObject(
+					document,
+					"configured_transport_workers",
+					configured_transport_workers) ||
+				!cJSON_AddNumberToObject(
+					document,
+					"transport_workers",
+					transport_workers) ||
+				!cJSON_AddNumberToObject(
+					document,
+					"transport_workers_running",
+					transport_workers_running) ||
+				!cJSON_AddNumberToObject(
+					document,
+					"transport_workers_used",
+					transport_workers_used) ||
+				!cJSON_AddNumberToObject(
+					document,
+					"transport_worker_max_streams",
+					transport_worker_max_streams) ||
+				!cJSON_AddNumberToObject(
+					document,
+					"hard_maximum_transport_workers",
+					MWS_HARD_MAXIMUM_TRANSPORT_WORKERS) ||
 				!cJSON_AddNumberToObject(
 					document,
 					"active_streams",
@@ -9438,6 +9814,10 @@ SWITCH_STANDARD_API(websocket_stream_api)
 			"channel_to_websocket=%s websocket_to_channel=%s "
 			"reconnect_attempts=%d reconnect_delay_ms=%d "
 			"configured_headers=%u statistics_interval_ms=%d "
+			"configured_transport_workers=%d transport_workers=%u "
+			"transport_workers_running=%u transport_workers_used=%u "
+			"transport_worker_max_streams=%u "
+			"hard_maximum_transport_workers=%u "
 			"active_streams=%u reserved_streams=%u "
 			"maximum_streams=%d hard_maximum_streams=%u "
 			"maximum_streams_per_channel=%d "
@@ -9474,6 +9854,12 @@ SWITCH_STANDARD_API(websocket_stream_api)
 			reconnect_delay_ms,
 			configured_header_count,
 			statistics_interval_ms,
+			configured_transport_workers,
+			transport_workers,
+			transport_workers_running,
+			transport_workers_used,
+			transport_worker_max_streams,
+			MWS_HARD_MAXIMUM_TRANSPORT_WORKERS,
 			active_streams,
 			reserved_streams,
 			maximum_streams,
@@ -9640,7 +10026,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_websocket_stream_load)
 		return SWITCH_STATUS_FALSE;
 	}
 
-	if (start_transport_worker(pool) != SWITCH_STATUS_SUCCESS) {
+	if (start_transport_workers(pool) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(
 				SWITCH_CHANNEL_LOG,
 				SWITCH_LOG_CRIT,
@@ -9707,13 +10093,13 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_websocket_stream_shutdown)
 
 	api_worker_status = stop_api_command_worker();
 
-	switch_mutex_lock(globals.worker_mutex);
-	globals.worker_stopping = SWITCH_TRUE;
-	switch_mutex_unlock(globals.worker_mutex);
+	switch_mutex_lock(globals.transport_assignment_mutex);
+	globals.transport_workers_stopping = SWITCH_TRUE;
+	switch_mutex_unlock(globals.transport_assignment_mutex);
 
 	stop_all_streams();
 	cleanup_worker_status = stop_cleanup_worker();
-	worker_status = stop_transport_worker();
+	worker_status = stop_transport_workers();
 	switch_event_free_subclass(MWS_ERROR_EVENT_SUBCLASS);
 	switch_event_free_subclass(MWS_STATISTICS_EVENT_SUBCLASS);
 	switch_event_free_subclass(MWS_TRANSPORT_EVENT_SUBCLASS);

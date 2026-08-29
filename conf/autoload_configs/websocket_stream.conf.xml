@@ -7,6 +7,14 @@
     -->
 
     <!--
+      Transport work is sharded across worker threads. By default the module
+      uses half the detected CPUs, with a minimum of 1 and a maximum of 8.
+      Set an explicit value from 1 through 32 to override automatic selection.
+      This setting takes effect when the module is loaded, not on config reload.
+      <param name="transport-workers" value="0"/>
+    -->
+
+    <!--
       Audio FreeSWITCH sends to the WebSocket:
         read   = audio arriving from the attached channel's remote side
         write  = audio leaving FreeSWITCH toward that remote side

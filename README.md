@@ -92,6 +92,7 @@ Omitted settings use these defaults:
 | `reconnect-attempts` | `5` | Retries after an unexpected connection failure. Use `0` to disable. |
 | `reconnect-delay-ms` | `1000` | Initial retry delay. It doubles on each attempt, up to 30 seconds. |
 | `statistics-interval-ms` | `10000` | Statistics event interval. Use `0` to disable statistics events. |
+| `transport-workers` | `0` (automatic) | Transport threads. Automatic uses half the detected CPUs, capped at 8. Explicit range: 1–32. Requires a module reload. |
 | `maximum-streams` | `256` | Streams allowed across FreeSWITCH. |
 | `maximum-streams-per-channel` | `16` | Streams allowed on one call. |
 | `maximum-http-headers` | `64` | Headers allowed on one WebSocket request. |
