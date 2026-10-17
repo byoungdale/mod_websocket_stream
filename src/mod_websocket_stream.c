@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <curl/curl.h>
 #include <errno.h>
 #include <switch.h>
@@ -20,6 +21,7 @@
 #define MWS_API_SYNTAX "status [json]|reload"
 #define MWS_UUID_API_SYNTAX \
 	"<channel-uuid> clear [stream-id]|" \
+	"<channel-uuid> send [stream-id|all] <json>|" \
 	"<channel-uuid> status [stream-id] [json]"
 #define MWS_APP_SYNTAX "<ws-url>"
 #define MWS_STOP_APP_SYNTAX "[stream-id|all]"
@@ -27,6 +29,9 @@
 #define MWS_TRANSPORT_EVENT_SUBCLASS "mod_websocket_stream::transport"
 #define MWS_STATISTICS_EVENT_SUBCLASS "mod_websocket_stream::statistics"
 #define MWS_ERROR_EVENT_SUBCLASS "mod_websocket_stream::error"
+#define MWS_MESSAGE_EVENT_SUBCLASS "mod_websocket_stream::message"
+#define MWS_API_COMMANDS_VARIABLE "websocket_stream_api_commands"
+#define MWS_MAXIMUM_MESSAGE_EVENT_NAME_BYTES 128
 #define MWS_PLAYBACK_BUFFER_OVERFLOW_ERROR "playback_buffer_overflow"
 #define MWS_TRANSPORT_STATE_VARIABLE "websocket_stream_last_transport_state"
 #define MWS_CURL_CODE_VARIABLE "websocket_stream_last_curl_code"
@@ -143,6 +148,7 @@
 	"mod_websocket_stream::channel_context:" MWS_BUILD_ID
 #define MWS_MAXIMUM_TEXT_MESSAGE_BYTES 4096
 #define MWS_TEXT_RESPONSE_QUEUE_CAPACITY 16
+#define MWS_OUTBOUND_MESSAGE_QUEUE_CAPACITY 8
 #define MWS_MAXIMUM_INTERNAL_RESPONSE_BYTES 1024
 #define MWS_API_COMMAND_QUEUE_CAPACITY 1024
 #define MWS_API_COMMAND_QUEUE_STORAGE_CAPACITY \
@@ -331,6 +337,8 @@ struct mws_stream_s {
 	switch_size_t maximum_start_variable_bytes;
 	switch_size_t maximum_start_message_bytes;
 	switch_size_t maximum_api_response_bytes;
+	switch_bool_t api_commands_enabled;
+	switch_bool_t peer_close_received;
 	uint64_t captured_media_frame_count;
 	uint64_t captured_native_byte_count;
 	uint64_t media_callback_budget_hit_count;
@@ -351,6 +359,17 @@ struct mws_stream_s {
 	switch_size_t inbound_text_message_length_bytes;
 	switch_bool_t inbound_text_message_active;
 	switch_bool_t inbound_text_message_too_large;
+	char inbound_text_message_first_byte;
+	switch_mutex_t *outbound_message_mutex;
+	char (*outbound_messages)[MWS_MAXIMUM_TEXT_MESSAGE_BYTES];
+	switch_size_t *outbound_message_lengths;
+	switch_size_t outbound_message_read_index;
+	switch_size_t outbound_message_write_index;
+	switch_size_t outbound_message_count;
+	switch_size_t outbound_message_offset_bytes;
+	switch_bool_t outbound_message_frame_started;
+	_Atomic uint64_t outbound_message_sent_count;
+	uint64_t dropped_outbound_message_count;
 	char (*text_response_queue)[MWS_MAXIMUM_INTERNAL_RESPONSE_BYTES];
 	switch_size_t *text_response_lengths;
 	switch_size_t text_response_read_index;
@@ -375,6 +394,8 @@ struct mws_stream_s {
 	uint64_t api_command_failed_count;
 	uint64_t api_command_result_byte_count;
 	_Atomic uint64_t rejected_api_command_count;
+	_Atomic uint64_t message_event_count;
+	_Atomic uint64_t rejected_message_count;
 	uint64_t dropped_text_response_count;
 	mws_playback_audio_buffer_t playback_audio_buffer;
 	mws_source_audio_buffer_t source_audio_buffer;
@@ -546,6 +567,7 @@ static struct {
 	uint64_t transport_event_count;
 	uint64_t statistics_event_count;
 	uint64_t error_event_count;
+	uint64_t message_event_count;
 	uint64_t automatic_cleanup_request_count;
 	mws_stream_t *streams;
 	uint32_t active_streams;
@@ -558,6 +580,7 @@ static struct {
 	int maximum_start_variable_bytes;
 	int maximum_start_message_bytes;
 	int maximum_api_response_bytes;
+	switch_bool_t api_commands_enabled;
 	int target_sample_rate;
 	mws_channel_to_websocket_t channel_to_websocket;
 	mws_websocket_to_channel_t websocket_to_channel;
@@ -800,6 +823,17 @@ static switch_xml_config_item_t config_instructions[] = {
 			&maximum_api_response_bytes_options,
 			"<integer-bytes>",
 			"Maximum API response returned over WebSocket (default: 65536)."),
+	SWITCH_CONFIG_ITEM(
+			"api-commands",
+			SWITCH_CONFIG_BOOL,
+			CONFIG_RELOADABLE,
+			&globals.api_commands_enabled,
+			(void *) SWITCH_TRUE,
+			NULL,
+			"true|false",
+			"Execute plain-text WebSocket messages as FreeSWITCH API "
+			"commands. JSON messages and clear are accepted either way "
+			"(default: true)."),
 	SWITCH_CONFIG_ITEM_END()
 };
 
@@ -819,6 +853,7 @@ typedef struct {
 	int maximum_start_variable_bytes;
 	int maximum_start_message_bytes;
 	int maximum_api_response_bytes;
+	switch_bool_t api_commands_enabled;
 } mws_config_snapshot_t;
 
 static void snapshot_config_locked(mws_config_snapshot_t *snapshot)
@@ -842,6 +877,7 @@ static void snapshot_config_locked(mws_config_snapshot_t *snapshot)
 	snapshot->maximum_start_message_bytes =
 			globals.maximum_start_message_bytes;
 	snapshot->maximum_api_response_bytes = globals.maximum_api_response_bytes;
+	snapshot->api_commands_enabled = globals.api_commands_enabled;
 }
 
 static void restore_config_locked(const mws_config_snapshot_t *snapshot)
@@ -865,6 +901,7 @@ static void restore_config_locked(const mws_config_snapshot_t *snapshot)
 	globals.maximum_start_message_bytes =
 			snapshot->maximum_start_message_bytes;
 	globals.maximum_api_response_bytes = snapshot->maximum_api_response_bytes;
+	globals.api_commands_enabled = snapshot->api_commands_enabled;
 }
 
 static switch_bool_t configured_limit_range(
@@ -1265,6 +1302,10 @@ static switch_status_t build_start_message(
 				root,
 				"channel_uuid",
 				stream_context->session_uuid) ||
+			!cJSON_AddBoolToObject(
+				root,
+				"api_commands",
+				stream_context->api_commands_enabled ? 1 : 0) ||
 			!cJSON_AddStringToObject(audio, "format", "s16le") ||
 			!cJSON_AddNumberToObject(
 				audio,
@@ -1487,6 +1528,8 @@ static switch_status_t initialize_stream_context(
 	atomic_init(&stream_context->playback_overflow_active, 0);
 	atomic_init(&stream_context->playback_format_change_count, 0);
 	atomic_init(&stream_context->rejected_api_command_count, 0);
+	atomic_init(&stream_context->message_event_count, 0);
+	atomic_init(&stream_context->rejected_message_count, 0);
 	atomic_init(&stream_context->shutdown_requested, false);
 	atomic_init(&stream_context->startup_complete, false);
 	atomic_init(&stream_context->teardown_claimed, false);
@@ -1503,6 +1546,14 @@ static switch_status_t initialize_stream_context(
 				resource_pool) != SWITCH_STATUS_SUCCESS) {
 		return SWITCH_STATUS_FALSE;
 	}
+
+	if (switch_mutex_init(
+				&stream_context->outbound_message_mutex,
+				SWITCH_MUTEX_UNNESTED,
+				resource_pool) != SWITCH_STATUS_SUCCESS) {
+		return SWITCH_STATUS_FALSE;
+	}
+	atomic_init(&stream_context->outbound_message_sent_count, 0);
 
 	if (switch_thread_cond_create(
 				&stream_context->worker_state_condition,
@@ -1528,6 +1579,14 @@ static switch_status_t initialize_stream_context(
 			resource_pool,
 			MWS_TEXT_RESPONSE_QUEUE_CAPACITY *
 					sizeof(*stream_context->text_response_lengths));
+	stream_context->outbound_messages = switch_core_alloc(
+			resource_pool,
+			MWS_OUTBOUND_MESSAGE_QUEUE_CAPACITY *
+					MWS_MAXIMUM_TEXT_MESSAGE_BYTES);
+	stream_context->outbound_message_lengths = switch_core_alloc(
+			resource_pool,
+			MWS_OUTBOUND_MESSAGE_QUEUE_CAPACITY *
+					sizeof(*stream_context->outbound_message_lengths));
 
 	captured_ring_storage = switch_core_alloc(
 			resource_pool,
@@ -2213,6 +2272,64 @@ static void worker_set_transport_state(
 	switch_mutex_unlock(globals.worker_mutex);
 }
 
+/* Adds the channel's event data, or just Unique-ID once the session is gone. */
+static void add_stream_channel_event_data(
+		switch_event_t *event,
+		mws_stream_t *stream_context)
+{
+	switch_core_session_t *session =
+			switch_core_session_locate(stream_context->session_uuid);
+
+	if (session) {
+		switch_channel_event_set_data(
+				switch_core_session_get_channel(session),
+				event);
+		switch_core_session_rwunlock(session);
+		return;
+	}
+	switch_event_add_header_string(
+			event,
+			SWITCH_STACK_BOTTOM,
+			"Unique-ID",
+			stream_context->session_uuid);
+}
+
+/* Reports who closed the connection and, for the peer, its close frame. */
+static void add_close_event_headers(
+		switch_event_t *event,
+		mws_stream_t *stream_context)
+{
+	const uint8_t *payload = stream_context->close_frame_payload;
+	switch_size_t payload_length =
+			stream_context->close_frame_payload_length_bytes;
+	char close_text[MWS_WEBSOCKET_MAXIMUM_CLOSE_PAYLOAD_BYTES + 1];
+
+	switch_event_add_header_string(
+			event,
+			SWITCH_STACK_BOTTOM,
+			"WebSocket-Stream-Close-Initiator",
+			stream_context->peer_close_received ? "peer" : "module");
+	if (!stream_context->peer_close_received || payload_length < 2) {
+		return;
+	}
+
+	switch_event_add_header(
+			event,
+			SWITCH_STACK_BOTTOM,
+			"WebSocket-Stream-Close-Code",
+			"%u",
+			(unsigned int) (((unsigned int) payload[0] << 8) | payload[1]));
+	if (payload_length > 2) {
+		memcpy(close_text, payload + 2, payload_length - 2);
+		close_text[payload_length - 2] = '\0';
+		switch_event_add_header_string(
+				event,
+				SWITCH_STACK_BOTTOM,
+				"WebSocket-Stream-Close-Text",
+				close_text);
+	}
+}
+
 static void worker_fire_transport_event(
 		mws_stream_t *stream_context,
 		mws_transport_state_t state,
@@ -2233,11 +2350,7 @@ static void worker_fire_transport_event(
 		return;
 	}
 
-	switch_event_add_header_string(
-			event,
-			SWITCH_STACK_BOTTOM,
-			"Unique-ID",
-			stream_context->session_uuid);
+	add_stream_channel_event_data(event, stream_context);
 	switch_event_add_header_string(
 			event,
 			SWITCH_STACK_BOTTOM,
@@ -2410,6 +2523,9 @@ static void worker_fire_transport_event(
 			"%" SWITCH_UINT64_T_FMT,
 			statistics.playback_deferred_callbacks);
 
+	if (state == MWS_TRANSPORT_CLOSED) {
+		add_close_event_headers(event, stream_context);
+	}
 	add_playback_rate_event_headers(event, &statistics);
 	add_playback_timing_event_headers(event, &statistics);
 	event_status = switch_event_fire(&event);
@@ -3556,6 +3672,175 @@ static uint64_t worker_clear_websocket_audio(mws_stream_t *stream_context)
 	return discarded_sample_count;
 }
 
+static void worker_reject_json_message(
+		mws_stream_t *stream_context,
+		const char *error,
+		const char *message)
+{
+	char response[MWS_MAXIMUM_INTERNAL_RESPONSE_BYTES];
+
+	atomic_fetch_add_explicit(
+			&stream_context->rejected_message_count,
+			1,
+			memory_order_relaxed);
+	switch_snprintf(
+			response,
+			sizeof(response),
+			"{\"event\":\"error\",\"error\":\"%s\",\"message\":\"%s\"}",
+			error,
+			message);
+	(void) worker_queue_text_response(stream_context, response);
+}
+
+static switch_bool_t message_event_name_is_valid(const char *name)
+{
+	const char *character;
+
+	if (zstr(name) ||
+			strlen(name) > MWS_MAXIMUM_MESSAGE_EVENT_NAME_BYTES) {
+		return SWITCH_FALSE;
+	}
+	for (character = name; *character; character++) {
+		if (!isalnum((unsigned char) *character) &&
+				*character != '_' && *character != '-' &&
+				*character != '.' && *character != ':') {
+			return SWITCH_FALSE;
+		}
+	}
+
+	return SWITCH_TRUE;
+}
+
+/* Names the module uses itself, or reserves for future control messages. */
+static switch_bool_t message_event_name_is_reserved(const char *name)
+{
+	static const char *reserved_names[] = {
+		"start", "stop", "error", "mark", NULL
+	};
+	const char **reserved;
+
+	for (reserved = reserved_names; *reserved; reserved++) {
+		if (!strcasecmp(name, *reserved)) {
+			return SWITCH_TRUE;
+		}
+	}
+
+	return SWITCH_FALSE;
+}
+
+static switch_status_t worker_fire_message_event(
+		mws_stream_t *stream_context,
+		const char *event_name,
+		const char *body)
+{
+	switch_event_t *event = NULL;
+	switch_status_t status;
+
+	if (switch_event_create_subclass(
+			&event,
+			SWITCH_EVENT_CUSTOM,
+			MWS_MESSAGE_EVENT_SUBCLASS) != SWITCH_STATUS_SUCCESS) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	add_stream_channel_event_data(event, stream_context);
+	switch_event_add_header_string(
+			event,
+			SWITCH_STACK_BOTTOM,
+			"WebSocket-Stream-ID",
+			stream_context->stream_id);
+	switch_event_add_header_string(
+			event,
+			SWITCH_STACK_BOTTOM,
+			"WebSocket-Stream-Message-Event",
+			event_name);
+	switch_event_add_body(event, "%s", body);
+
+	status = switch_event_fire(&event);
+	if (status == SWITCH_STATUS_SUCCESS) {
+		atomic_fetch_add_explicit(
+				&stream_context->message_event_count,
+				1,
+				memory_order_relaxed);
+		switch_mutex_lock(globals.worker_mutex);
+		globals.message_event_count++;
+		switch_mutex_unlock(globals.worker_mutex);
+	} else if (event) {
+		switch_event_destroy(&event);
+	}
+
+	return status;
+}
+
+/*
+ * A JSON object with a string "event" member. "clear" discards queued
+ * WebSocket audio on this stream; any other name is fired as a
+ * mod_websocket_stream::message event carrying the original JSON as its body.
+ */
+static void worker_accept_json_message(
+		mws_stream_t *stream_context,
+		const char *message,
+		switch_size_t message_length)
+{
+	cJSON *root = NULL;
+	const char *event_name;
+
+	if (memchr(message, '\0', message_length)) {
+		worker_reject_json_message(
+				stream_context,
+				"invalid_message",
+				"message contains a NUL byte");
+		return;
+	}
+
+	root = cJSON_Parse(message);
+	if (!root || !cJSON_IsObject(root)) {
+		worker_reject_json_message(
+				stream_context,
+				"invalid_message",
+				"message is not a JSON object");
+		goto done;
+	}
+
+	event_name = cJSON_GetObjectCstr(root, "event");
+	if (!message_event_name_is_valid(event_name)) {
+		worker_reject_json_message(
+				stream_context,
+				"invalid_event",
+				"event must be a string of up to 128 letters, digits, "
+				"or _ - . : characters");
+		goto done;
+	}
+
+	if (!strcasecmp(event_name, "clear")) {
+		(void) worker_clear_websocket_audio(stream_context);
+		goto done;
+	}
+
+	if (message_event_name_is_reserved(event_name)) {
+		worker_reject_json_message(
+				stream_context,
+				"reserved_event",
+				"event name is reserved by mod_websocket_stream");
+		goto done;
+	}
+
+	if (worker_fire_message_event(
+			stream_context,
+			event_name,
+			message) != SWITCH_STATUS_SUCCESS) {
+		worker_reject_json_message(
+				stream_context,
+				"event_failed",
+				"could not fire FreeSWITCH event");
+	}
+
+done:
+	if (root) {
+		cJSON_Delete(root);
+	}
+}
+
 static void worker_accept_inbound_text(
 		mws_stream_t *stream_context,
 		const char *data,
@@ -3563,11 +3848,21 @@ static void worker_accept_inbound_text(
 		const struct curl_ws_frame *metadata)
 {
 	switch_size_t available_bytes;
+	switch_size_t index;
+	switch_bool_t json_message;
 
 	if (!stream_context->inbound_text_message_active) {
 		stream_context->inbound_text_message_active = SWITCH_TRUE;
 		stream_context->inbound_text_message_length_bytes = 0;
 		stream_context->inbound_text_message_too_large = SWITCH_FALSE;
+		stream_context->inbound_text_message_first_byte = '\0';
+	}
+
+	for (index = 0; !stream_context->inbound_text_message_first_byte &&
+			index < data_length; index++) {
+		if (!isspace((unsigned char) data[index])) {
+			stream_context->inbound_text_message_first_byte = data[index];
+		}
 	}
 
 	available_bytes = MWS_MAXIMUM_TEXT_MESSAGE_BYTES -
@@ -3589,14 +3884,38 @@ static void worker_accept_inbound_text(
 		return;
 	}
 
+	/* API command names never begin with '{', so JSON is unambiguous. */
+	json_message = stream_context->inbound_text_message_first_byte == '{';
 	if (stream_context->inbound_text_message_too_large) {
+		if (json_message) {
+			worker_reject_json_message(
+					stream_context,
+					"message_too_large",
+					"JSON messages may not exceed 4096 bytes");
+		} else {
+			atomic_fetch_add_explicit(
+					&stream_context->rejected_api_command_count,
+					1,
+					memory_order_relaxed);
+			(void) worker_queue_text_response(
+					stream_context,
+					"-ERR FreeSWITCH API commands may not exceed 4096 bytes\n");
+		}
+	} else if (json_message) {
+		stream_context->inbound_text_message
+				[stream_context->inbound_text_message_length_bytes] = '\0';
+		worker_accept_json_message(
+				stream_context,
+				stream_context->inbound_text_message,
+				stream_context->inbound_text_message_length_bytes);
+	} else if (!stream_context->api_commands_enabled) {
 		atomic_fetch_add_explicit(
 				&stream_context->rejected_api_command_count,
 				1,
 				memory_order_relaxed);
 		(void) worker_queue_text_response(
 				stream_context,
-				"-ERR FreeSWITCH API commands may not exceed 4096 bytes\n");
+				"-ERR FreeSWITCH API commands are disabled for this stream\n");
 	} else {
 		stream_context->inbound_text_message
 				[stream_context->inbound_text_message_length_bytes] = '\0';
@@ -4346,6 +4665,7 @@ static switch_status_t worker_accept_peer_close_frame(
 			stream_context->close_frame_payload_length_bytes = 0;
 			return SWITCH_STATUS_FALSE;
 		}
+		stream_context->peer_close_received = SWITCH_TRUE;
 		stream_context->normal_close_requested = SWITCH_TRUE;
 		stream_context->normal_close_deadline = switch_time_now() +
 				MWS_CLOSE_HANDSHAKE_TIMEOUT_US;
@@ -4523,6 +4843,16 @@ static void worker_reset_connection_attempt(mws_stream_t *stream_context)
 	stream_context->text_response_count = 0;
 	stream_context->text_response_offset_bytes = 0;
 	stream_context->text_response_frame_started = SWITCH_FALSE;
+	stream_context->peer_close_received = SWITCH_FALSE;
+	stream_context->outbound_message_frame_started = SWITCH_FALSE;
+	stream_context->outbound_message_offset_bytes = 0;
+	switch_mutex_lock(stream_context->outbound_message_mutex);
+	stream_context->dropped_outbound_message_count +=
+			stream_context->outbound_message_count;
+	stream_context->outbound_message_read_index = 0;
+	stream_context->outbound_message_write_index = 0;
+	stream_context->outbound_message_count = 0;
+	switch_mutex_unlock(stream_context->outbound_message_mutex);
 }
 
 static uint32_t calculate_reconnect_delay_ms(mws_stream_t *stream_context)
@@ -4726,6 +5056,92 @@ static size_t worker_upload_text_response(
 	return upload_length_bytes;
 }
 
+static switch_bool_t worker_has_outbound_message(mws_stream_t *stream_context)
+{
+	switch_bool_t has_message;
+
+	switch_mutex_lock(stream_context->outbound_message_mutex);
+	has_message = stream_context->outbound_message_count ?
+			SWITCH_TRUE : SWITCH_FALSE;
+	switch_mutex_unlock(stream_context->outbound_message_mutex);
+
+	return has_message;
+}
+
+/*
+ * The producer only writes the slot at write_index, so the slot at
+ * read_index can be read without the mutex while the frame is uploaded.
+ */
+static size_t worker_upload_outbound_message(
+		mws_stream_t *stream_context,
+		char *data,
+		switch_size_t upload_capacity_bytes)
+{
+	const char *message;
+	switch_size_t message_length_bytes;
+	switch_size_t remaining_bytes;
+	switch_size_t upload_length_bytes;
+	CURLcode result;
+
+	if (!upload_capacity_bytes ||
+			!worker_has_outbound_message(stream_context)) {
+		return CURL_READFUNC_ABORT;
+	}
+
+	message = stream_context->outbound_messages
+			[stream_context->outbound_message_read_index];
+	message_length_bytes = stream_context->outbound_message_lengths
+			[stream_context->outbound_message_read_index];
+
+	if (!stream_context->outbound_message_frame_started) {
+		result = curl_ws_start_frame(
+				stream_context->easy,
+				CURLWS_TEXT,
+				(curl_off_t) message_length_bytes);
+		if (result == CURLE_AGAIN) {
+			stream_context->upload_paused = SWITCH_TRUE;
+			return CURL_READFUNC_PAUSE;
+		}
+		if (result != CURLE_OK) {
+			stream_context->curl_result = result;
+			return CURL_READFUNC_ABORT;
+		}
+		stream_context->outbound_message_frame_started = SWITCH_TRUE;
+	}
+
+	remaining_bytes = message_length_bytes -
+			stream_context->outbound_message_offset_bytes;
+	upload_length_bytes = remaining_bytes < upload_capacity_bytes ?
+			remaining_bytes : upload_capacity_bytes;
+
+	memcpy(
+			data,
+			message + stream_context->outbound_message_offset_bytes,
+			upload_length_bytes);
+	stream_context->outbound_message_offset_bytes += upload_length_bytes;
+
+	if (stream_context->outbound_message_offset_bytes ==
+			message_length_bytes) {
+		stream_context->outbound_message_frame_started = SWITCH_FALSE;
+		stream_context->outbound_message_offset_bytes = 0;
+		switch_mutex_lock(stream_context->outbound_message_mutex);
+		stream_context->outbound_message_read_index =
+				(stream_context->outbound_message_read_index + 1) %
+				MWS_OUTBOUND_MESSAGE_QUEUE_CAPACITY;
+		stream_context->outbound_message_count--;
+		switch_mutex_unlock(stream_context->outbound_message_mutex);
+		atomic_fetch_add_explicit(
+				&stream_context->outbound_message_sent_count,
+				1,
+				memory_order_relaxed);
+		stream_context->text_frame_sent_count++;
+		stream_context->text_byte_sent_count += message_length_bytes;
+	}
+
+	stream_context->upload_paused = SWITCH_FALSE;
+	return upload_length_bytes;
+}
+
 static size_t worker_upload_normal_close_frame(
 		mws_stream_t *stream_context,
 		char *data,
@@ -4819,6 +5235,18 @@ static size_t websocket_upload_callback(
 					data,
 					upload_capacity_bytes);
 		}
+		/* Deliver queued application messages before closing. */
+		if (stream_context->start_message_sent &&
+				!stream_context->peer_close_received &&
+				!stream_context->close_frame_started &&
+				!stream_context->close_frame_sent &&
+				(stream_context->outbound_message_frame_started ||
+				 worker_has_outbound_message(stream_context))) {
+			return worker_upload_outbound_message(
+					stream_context,
+					data,
+					upload_capacity_bytes);
+		}
 		return worker_upload_normal_close_frame(
 				stream_context,
 				data,
@@ -4843,6 +5271,13 @@ static size_t websocket_upload_callback(
 	if (stream_context->text_response_count &&
 			!api_command_active) {
 		return worker_upload_text_response(
+				stream_context,
+				data,
+				upload_capacity_bytes);
+	}
+	if (stream_context->outbound_message_frame_started ||
+			worker_has_outbound_message(stream_context)) {
+		return worker_upload_outbound_message(
 				stream_context,
 				data,
 				upload_capacity_bytes);
@@ -5514,7 +5949,8 @@ static switch_bool_t worker_has_upload_data(
 	switch_mutex_unlock(stream_context->api_command_mutex);
 	if (api_command_result_ready ||
 			(stream_context->text_response_count &&
-			 !api_command_active)) {
+			 !api_command_active) ||
+			worker_has_outbound_message(stream_context)) {
 		return SWITCH_TRUE;
 	}
 
@@ -7155,6 +7591,28 @@ static switch_status_t add_stream_status_json(
 				stream_status,
 				"websocket_to_channel",
 				websocket_to_channel ? websocket_to_channel : "unknown") ||
+			!cJSON_AddBoolToObject(
+				stream_status,
+				"api_commands",
+				stream_context->api_commands_enabled ? 1 : 0) ||
+			!cJSON_AddNumberToObject(
+				stream_status,
+				"message_events",
+				(double) atomic_load_explicit(
+					&stream_context->message_event_count,
+					memory_order_relaxed)) ||
+			!cJSON_AddNumberToObject(
+				stream_status,
+				"rejected_messages",
+				(double) atomic_load_explicit(
+					&stream_context->rejected_message_count,
+					memory_order_relaxed)) ||
+			!cJSON_AddNumberToObject(
+				stream_status,
+				"outbound_messages_sent",
+				(double) atomic_load_explicit(
+					&stream_context->outbound_message_sent_count,
+					memory_order_relaxed)) ||
 			!cJSON_AddStringToObject(
 				stream_status,
 				"playback_state",
@@ -7508,6 +7966,10 @@ static void write_stream_status(
 			stream,
 			"stream_id=%s state=%s target_rate_hz=%d "
 			"channel_to_websocket=%s websocket_to_channel=%s "
+			"api_commands=%s "
+			"message_events=%" SWITCH_UINT64_T_FMT " "
+			"rejected_messages=%" SWITCH_UINT64_T_FMT " "
+			"outbound_messages_sent=%" SWITCH_UINT64_T_FMT " "
 			"playback_state=%s "
 			"captured_queued_bytes=%" SWITCH_SIZE_T_FMT " "
 			"captured_capacity_bytes=%" SWITCH_SIZE_T_FMT " "
@@ -7592,6 +8054,16 @@ static void write_stream_status(
 			stream_context->target_sample_rate,
 			channel_to_websocket ? channel_to_websocket : "unknown",
 			websocket_to_channel ? websocket_to_channel : "unknown",
+			stream_context->api_commands_enabled ? "true" : "false",
+			atomic_load_explicit(
+					&stream_context->message_event_count,
+					memory_order_relaxed),
+			atomic_load_explicit(
+					&stream_context->rejected_message_count,
+					memory_order_relaxed),
+			atomic_load_explicit(
+					&stream_context->outbound_message_sent_count,
+					memory_order_relaxed),
 			playback_state_name(statistics.playback_state),
 			statistics.captured_queued_bytes,
 			statistics.captured_capacity_bytes,
@@ -8802,8 +9274,16 @@ SWITCH_STANDARD_APP(websocket_stream_app)
 			(switch_size_t) globals.maximum_start_message_bytes;
 	stream_context->maximum_api_response_bytes =
 			(switch_size_t) globals.maximum_api_response_bytes;
+	stream_context->api_commands_enabled = globals.api_commands_enabled;
 
 	switch_mutex_unlock(globals.config_mutex);
+
+	/* The channel variable may only narrow the configured setting. */
+	if (switch_false(switch_channel_get_variable(
+			channel,
+			MWS_API_COMMANDS_VARIABLE))) {
+		stream_context->api_commands_enabled = SWITCH_FALSE;
+	}
 
 	if (initialize_stream_context(session, stream_context) !=
 			SWITCH_STATUS_SUCCESS) {
@@ -9199,6 +9679,210 @@ SWITCH_STANDARD_APP(websocket_stream_stop_app)
 			stopped_count);
 }
 
+static const char *queue_outbound_message(
+		mws_stream_t *stream_context,
+		const char *message,
+		switch_size_t message_length)
+{
+	mws_transport_state_t transport_state;
+	switch_size_t slot;
+
+	if (atomic_load_explicit(
+			&stream_context->shutdown_requested,
+			memory_order_acquire)) {
+		return "stream is stopping";
+	}
+	switch_mutex_lock(globals.worker_mutex);
+	transport_state = stream_context->transport_state;
+	switch_mutex_unlock(globals.worker_mutex);
+	if (transport_state != MWS_TRANSPORT_OPEN) {
+		return "stream is not connected";
+	}
+
+	switch_mutex_lock(stream_context->outbound_message_mutex);
+	if (stream_context->outbound_message_count >=
+			MWS_OUTBOUND_MESSAGE_QUEUE_CAPACITY) {
+		switch_mutex_unlock(stream_context->outbound_message_mutex);
+		return "outbound message queue is full";
+	}
+	slot = stream_context->outbound_message_write_index;
+	memcpy(stream_context->outbound_messages[slot], message, message_length);
+	stream_context->outbound_message_lengths[slot] = message_length;
+	stream_context->outbound_message_write_index =
+			(slot + 1) % MWS_OUTBOUND_MESSAGE_QUEUE_CAPACITY;
+	stream_context->outbound_message_count++;
+	switch_mutex_unlock(stream_context->outbound_message_mutex);
+
+	return NULL;
+}
+
+/* <channel-uuid> send <stream-id|all> <json>; the JSON may contain spaces. */
+static void uuid_websocket_stream_send(
+		const char *cmd,
+		switch_stream_handle_t *stream)
+{
+	char *command_copy = NULL;
+	char *channel_uuid;
+	const char *target;
+	char *message;
+	char *cursor;
+	switch_size_t message_length;
+	cJSON *document = NULL;
+	switch_core_session_t *target_session = NULL;
+	mws_stream_t **stream_contexts = NULL;
+	switch_size_t stream_count = 0;
+	switch_size_t sent_stream_count = 0;
+	const char *last_error = NULL;
+	switch_size_t index;
+
+	if (!(command_copy = strdup(cmd))) {
+		stream->write_function(stream, "-ERR could not allocate command\n");
+		return;
+	}
+
+	cursor = command_copy;
+	while (*cursor && isspace((unsigned char) *cursor)) {
+		cursor++;
+	}
+	channel_uuid = cursor;
+	while (*cursor && !isspace((unsigned char) *cursor)) {
+		cursor++;
+	}
+	while (*cursor && isspace((unsigned char) *cursor)) {
+		*cursor++ = '\0';
+	}
+	while (*cursor && !isspace((unsigned char) *cursor)) {
+		cursor++; /* the "send" keyword */
+	}
+	while (*cursor && isspace((unsigned char) *cursor)) {
+		*cursor++ = '\0';
+	}
+	/* Stream IDs never begin with '{', so a missing target means all. */
+	if (*cursor == '{') {
+		target = "all";
+	} else {
+		target = cursor;
+		while (*cursor && !isspace((unsigned char) *cursor)) {
+			cursor++;
+		}
+		while (*cursor && isspace((unsigned char) *cursor)) {
+			*cursor++ = '\0';
+		}
+	}
+	message = cursor;
+	message_length = strlen(message);
+	while (message_length &&
+			isspace((unsigned char) message[message_length - 1])) {
+		message[--message_length] = '\0';
+	}
+
+	if (zstr(channel_uuid) || zstr(target) || !message_length) {
+		stream->write_function(
+				stream,
+				"-USAGE: uuid_websocket_stream %s\n",
+				MWS_UUID_API_SYNTAX);
+		goto done;
+	}
+	if (message_length > MWS_MAXIMUM_TEXT_MESSAGE_BYTES) {
+		stream->write_function(
+				stream,
+				"-ERR messages may not exceed %u bytes\n",
+				(unsigned int) MWS_MAXIMUM_TEXT_MESSAGE_BYTES);
+		goto done;
+	}
+	if (!mws_websocket_text_is_valid_utf8(
+				(const uint8_t *) message,
+				message_length) ||
+			!(document = cJSON_Parse(message)) ||
+			!cJSON_IsObject(document)) {
+		stream->write_function(
+				stream,
+				"-ERR message must be a UTF-8 JSON object\n");
+		goto done;
+	}
+
+	target_session = switch_core_session_locate(channel_uuid);
+	if (!target_session) {
+		stream->write_function(
+				stream,
+				"-ERR channel %s was not found\n",
+				channel_uuid);
+		goto done;
+	}
+	if (collect_registered_streams(
+			channel_uuid,
+			strcasecmp(target, "all") ? target : NULL,
+			&stream_contexts,
+			&stream_count) != SWITCH_STATUS_SUCCESS) {
+		stream->write_function(
+				stream,
+				"-ERR could not inspect WebSocket streams\n");
+		goto done;
+	}
+	if (!stream_count) {
+		stream->write_function(
+				stream,
+				"-ERR no matching WebSocket stream on channel %s\n",
+				channel_uuid);
+		goto done;
+	}
+
+	for (index = 0; index < stream_count; index++) {
+		const char *error = queue_outbound_message(
+				stream_contexts[index],
+				message,
+				message_length);
+
+		if (error) {
+			last_error = error;
+		} else {
+			sent_stream_count++;
+		}
+	}
+	if (sent_stream_count == stream_count) {
+		stream->write_function(
+				stream,
+				"+OK queued_streams=%" SWITCH_SIZE_T_FMT "\n",
+				sent_stream_count);
+	} else {
+		stream->write_function(
+				stream,
+				"-ERR %s queued_streams=%" SWITCH_SIZE_T_FMT
+				" failed_streams=%" SWITCH_SIZE_T_FMT "\n",
+				last_error,
+				sent_stream_count,
+				stream_count - sent_stream_count);
+	}
+
+done:
+	release_registered_streams(&stream_contexts, stream_count);
+	if (target_session) {
+		switch_core_session_rwunlock(target_session);
+	}
+	if (document) {
+		cJSON_Delete(document);
+	}
+	switch_safe_free(command_copy);
+}
+
+static switch_bool_t command_is_send(const char *cmd)
+{
+	const char *cursor = cmd;
+
+	while (*cursor && isspace((unsigned char) *cursor)) {
+		cursor++;
+	}
+	while (*cursor && !isspace((unsigned char) *cursor)) {
+		cursor++;
+	}
+	while (*cursor && isspace((unsigned char) *cursor)) {
+		cursor++;
+	}
+
+	return !strncasecmp(cursor, "send", 4) &&
+			(!cursor[4] || isspace((unsigned char) cursor[4]));
+}
+
 SWITCH_STANDARD_API(uuid_websocket_stream_api)
 {
 	char *command_copy = NULL;
@@ -9222,6 +9906,11 @@ SWITCH_STANDARD_API(uuid_websocket_stream_api)
 				stream,
 				"-USAGE: uuid_websocket_stream %s\n",
 				MWS_UUID_API_SYNTAX);
+		goto done;
+	}
+
+	if (command_is_send(cmd)) {
+		uuid_websocket_stream_send(cmd, stream);
 		goto done;
 	}
 
@@ -9436,6 +10125,7 @@ SWITCH_STANDARD_API(websocket_stream_api)
 	int maximum_start_variable_bytes;
 	int maximum_start_message_bytes;
 	int maximum_api_response_bytes;
+	switch_bool_t api_commands_enabled;
 	mws_channel_to_websocket_t channel_to_websocket_value;
 	mws_websocket_to_channel_t websocket_to_channel_value;
 	uint32_t configured_header_count;
@@ -9451,6 +10141,7 @@ SWITCH_STANDARD_API(websocket_stream_api)
 	uint64_t transport_event_count;
 	uint64_t statistics_event_count;
 	uint64_t error_event_count;
+	uint64_t message_event_count;
 	uint64_t automatic_cleanup_request_count;
 	unsigned int worker_queue_size;
 	uint32_t transport_workers;
@@ -9513,6 +10204,7 @@ SWITCH_STANDARD_API(websocket_stream_api)
 	maximum_start_variable_bytes = globals.maximum_start_variable_bytes;
 	maximum_start_message_bytes = globals.maximum_start_message_bytes;
 	maximum_api_response_bytes = globals.maximum_api_response_bytes;
+	api_commands_enabled = globals.api_commands_enabled;
 
 	switch_mutex_unlock(globals.config_mutex);
 
@@ -9568,6 +10260,7 @@ SWITCH_STANDARD_API(websocket_stream_api)
 	transport_event_count = globals.transport_event_count;
 	statistics_event_count = globals.statistics_event_count;
 	error_event_count = globals.error_event_count;
+	message_event_count = globals.message_event_count;
 	automatic_cleanup_request_count =
 			globals.automatic_cleanup_request_count;
 	switch_mutex_unlock(globals.worker_mutex);
@@ -9692,6 +10385,10 @@ SWITCH_STANDARD_API(websocket_stream_api)
 					document,
 					"maximum_api_response_bytes",
 					maximum_api_response_bytes) ||
+				!cJSON_AddBoolToObject(
+					document,
+					"api_commands",
+					api_commands_enabled ? 1 : 0) ||
 				!cJSON_AddNumberToObject(
 					document,
 					"hard_maximum_streams",
@@ -9778,6 +10475,10 @@ SWITCH_STANDARD_API(websocket_stream_api)
 					(double) error_event_count) ||
 				!cJSON_AddNumberToObject(
 					document,
+					"message_events",
+					(double) message_event_count) ||
+				!cJSON_AddNumberToObject(
+					document,
 					"automatic_cleanup_requests",
 					(double) automatic_cleanup_request_count) ||
 				!cJSON_AddNumberToObject(
@@ -9833,6 +10534,7 @@ SWITCH_STANDARD_API(websocket_stream_api)
 			"hard_maximum_start_message_bytes=%u "
 			"maximum_api_response_bytes=%d "
 			"hard_maximum_api_response_bytes=%u "
+			"api_commands=%s "
 			"worker=%s worker_queue=%u api_worker=%s api_queue=%u "
 			"cleanup_worker=%s cleanup_queue=%u "
 			"connections_connecting=%u "
@@ -9841,6 +10543,7 @@ SWITCH_STANDARD_API(websocket_stream_api)
 			"transport_events=%" SWITCH_UINT64_T_FMT " "
 			"statistics_events=%" SWITCH_UINT64_T_FMT " "
 			"error_events=%" SWITCH_UINT64_T_FMT " "
+			"message_events=%" SWITCH_UINT64_T_FMT " "
 			"automatic_cleanup_requests=%" SWITCH_UINT64_T_FMT " "
 			"reconnect_attempts_total=%" SWITCH_UINT64_T_FMT " "
 			"reconnect_successes=%" SWITCH_UINT64_T_FMT " "
@@ -9878,6 +10581,7 @@ SWITCH_STANDARD_API(websocket_stream_api)
 			MWS_HARD_MAXIMUM_START_MESSAGE_BYTES,
 			maximum_api_response_bytes,
 			MWS_HARD_MAXIMUM_API_RESPONSE_BYTES,
+			api_commands_enabled ? "true" : "false",
 			worker_running ? "running" : "stopped",
 			worker_queue_size,
 			api_command_worker_running ? "running" : "stopped",
@@ -9891,6 +10595,7 @@ SWITCH_STANDARD_API(websocket_stream_api)
 			transport_event_count,
 			statistics_event_count,
 			error_event_count,
+			message_event_count,
 			automatic_cleanup_request_count,
 			reconnect_attempt_count,
 			reconnect_success_count,
@@ -9998,12 +10703,27 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_websocket_stream_load)
 		cleanup_config();
 		return SWITCH_STATUS_FALSE;
 	}
+	if (switch_event_reserve_subclass(MWS_MESSAGE_EVENT_SUBCLASS) !=
+			SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(
+				SWITCH_CHANNEL_LOG,
+				SWITCH_LOG_CRIT,
+				"Could not reserve FreeSWITCH event subclass %s\n",
+				MWS_MESSAGE_EVENT_SUBCLASS);
+		switch_event_free_subclass(MWS_ERROR_EVENT_SUBCLASS);
+		switch_event_free_subclass(MWS_STATISTICS_EVENT_SUBCLASS);
+		switch_event_free_subclass(MWS_TRANSPORT_EVENT_SUBCLASS);
+		curl_global_cleanup();
+		cleanup_config();
+		return SWITCH_STATUS_FALSE;
+	}
 
 	if (start_api_command_worker(pool) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(
 				SWITCH_CHANNEL_LOG,
 				SWITCH_LOG_CRIT,
 				"Could not start FreeSWITCH API command worker\n");
+		switch_event_free_subclass(MWS_MESSAGE_EVENT_SUBCLASS);
 		switch_event_free_subclass(MWS_ERROR_EVENT_SUBCLASS);
 		switch_event_free_subclass(MWS_STATISTICS_EVENT_SUBCLASS);
 		switch_event_free_subclass(MWS_TRANSPORT_EVENT_SUBCLASS);
@@ -10018,6 +10738,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_websocket_stream_load)
 				SWITCH_LOG_CRIT,
 				"Could not start automatic stream cleanup worker\n");
 		(void) stop_api_command_worker();
+		switch_event_free_subclass(MWS_MESSAGE_EVENT_SUBCLASS);
 		switch_event_free_subclass(MWS_ERROR_EVENT_SUBCLASS);
 		switch_event_free_subclass(MWS_STATISTICS_EVENT_SUBCLASS);
 		switch_event_free_subclass(MWS_TRANSPORT_EVENT_SUBCLASS);
@@ -10033,6 +10754,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_websocket_stream_load)
 				"Could not start WebSocket transport worker\n");
 		(void) stop_cleanup_worker();
 		(void) stop_api_command_worker();
+		switch_event_free_subclass(MWS_MESSAGE_EVENT_SUBCLASS);
 		switch_event_free_subclass(MWS_ERROR_EVENT_SUBCLASS);
 		switch_event_free_subclass(MWS_STATISTICS_EVENT_SUBCLASS);
 		switch_event_free_subclass(MWS_TRANSPORT_EVENT_SUBCLASS);
@@ -10100,6 +10822,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_websocket_stream_shutdown)
 	stop_all_streams();
 	cleanup_worker_status = stop_cleanup_worker();
 	worker_status = stop_transport_workers();
+	switch_event_free_subclass(MWS_MESSAGE_EVENT_SUBCLASS);
 	switch_event_free_subclass(MWS_ERROR_EVENT_SUBCLASS);
 	switch_event_free_subclass(MWS_STATISTICS_EVENT_SUBCLASS);
 	switch_event_free_subclass(MWS_TRANSPORT_EVENT_SUBCLASS);

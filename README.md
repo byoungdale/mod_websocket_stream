@@ -101,6 +101,7 @@ Omitted settings use these defaults:
 | `maximum-start-variable-bytes` | `32768` | Total size of those variables. |
 | `maximum-start-message-bytes` | `65536` | Size of the start message. |
 | `maximum-api-response-bytes` | `65536` | Size of an API response returned over WebSocket. Minimum: 256. |
+| `api-commands` | `true` | Execute plain-text WebSocket messages as FreeSWITCH API commands. JSON messages and `clear` work either way. |
 
 For `channel-to-websocket`:
 
@@ -193,15 +194,86 @@ on the channel:
 ## WebSocket messages
 
 The first WebSocket message is JSON. It contains `stream_id`, `channel_uuid`,
+`api_commands` (whether plain-text API commands are accepted on this stream),
 the audio format and directions, and a snapshot of the channel variables.
 Variables used as WebSocket HTTP headers are excluded from that snapshot.
 
 - FreeSWITCH sends signed 16-bit little-endian PCM in binary WebSocket messages.
 - Binary messages received from the server are mono PCM at the configured sample
   rate.
-- Text received from the server is executed as a native FreeSWITCH API command.
-- The FreeSWITCH API response is returned as a text message. Responses over the
-  configured limit return an error.
+- Text beginning with `{` is a JSON message (see below). JSON messages are
+  always accepted.
+- Any other text is executed as a native FreeSWITCH API command when API
+  commands are enabled, and its response is returned as a text message.
+  Responses over the configured limit return an error. When API commands are
+  disabled, the module replies with
+  `-ERR FreeSWITCH API commands are disabled for this stream`.
+
+### JSON messages
+
+A JSON message is an object with a string `event` member of up to 128
+letters, digits, or `_ - . :` characters. Messages, like API commands, are
+limited to 4096 bytes.
+
+- `{"event":"clear"}` discards WebSocket audio already queued for playback on
+  this stream (barge-in). Audio sent after it is played normally. It sends no
+  reply.
+- Any other event is fired as a `mod_websocket_stream::message` FreeSWITCH
+  event. Its body is the JSON text exactly as received, so the contract between
+  the WebSocket server and the application consuming the event is entirely
+  yours. Nothing is sent back on success.
+- `start`, `stop`, `error`, and `mark` are reserved for the module and rejected.
+
+```json
+{"event": "transfer_requested", "target": "sales", "reason": "billing"}
+```
+
+A rejected JSON message is answered with a JSON error, for example:
+
+```json
+{"event":"error","error":"reserved_event","message":"event name is reserved by mod_websocket_stream"}
+```
+
+The `error` values are `invalid_message`, `invalid_event`, `reserved_event`,
+`message_too_large`, and `event_failed`.
+
+### Disabling API commands
+
+Set `api-commands` to `false` to keep the WebSocket server from running
+FreeSWITCH API commands. It can then only send audio, `clear`, and events, and
+call control stays with whatever consumes those events, such as an ESL
+application. To disable API commands for a single call, set this channel
+variable before starting the stream:
+
+```xml
+<action application="set" data="websocket_stream_api_commands=false"/>
+```
+
+The channel variable can only disable API commands; it cannot enable them when
+the configuration disables them.
+
+### Sending messages to the WebSocket server
+
+An ESL application can send a JSON message to the WebSocket server over the
+stream, for example to forward a DTMF digit or announce a transfer:
+
+```sh
+uuid_websocket_stream <channel-uuid> send {"event":"dtmf","digit":"1"}
+uuid_websocket_stream <channel-uuid> send <stream-id> {"event":"dtmf","digit":"1"}
+```
+
+Without a stream ID, or with `all`, the message goes to every stream on the
+channel.
+
+The message must be a UTF-8 JSON object of at most 4096 bytes; everything after
+the stream ID, spaces included, is sent as one text message. The module does not
+interpret it. Up to 8 messages can be queued per stream, and only while the
+stream is connected. Queued messages are sent before the module's close frame,
+so sending a message and then stopping the stream delivers the message first.
+
+Together with `mod_websocket_stream::message` events this gives a two-way JSON
+channel between the WebSocket server and an ESL application, while the module
+only carries audio and relays messages.
 
 ## Resource limits
 
@@ -223,6 +295,9 @@ fs_cli -x "uuid_websocket_stream <channel-uuid> status <stream-id> json"
 
 fs_cli -x "uuid_websocket_stream <channel-uuid> clear"
 fs_cli -x "uuid_websocket_stream <channel-uuid> clear <stream-id>"
+
+fs_cli -x 'uuid_websocket_stream <channel-uuid> send {"event":"hello"}'
+fs_cli -x 'uuid_websocket_stream <channel-uuid> send <stream-id> {"event":"hello"}'
 ```
 
 The status response includes connection state, audio settings, current queue
@@ -230,13 +305,19 @@ sizes, dropped audio, playback underflows, reconnects, and playback timing.
 
 ## FreeSWITCH events
 
-The module emits three `CUSTOM` event subclasses:
+The module emits four `CUSTOM` event subclasses:
 
 | Event subclass | When it is emitted | What it contains |
 | --- | --- | --- |
-| `mod_websocket_stream::transport` | A connection opens, begins reconnecting, closes, or finally fails. | Channel UUID, stream ID, state, curl result, retry information, and a playback/capture statistics snapshot. |
+| `mod_websocket_stream::transport` | A connection opens, begins reconnecting, closes, or finally fails. | Normal channel event data and variables, stream ID, state, curl result, retry information, close details, and a playback/capture statistics snapshot. |
 | `mod_websocket_stream::statistics` | Periodically while a connection is open. Default: every 10 seconds. | Channel UUID, stream ID, states, audio directions, target rate, queue sizes, drops, underflows, callback timing, rate adjustment, and reconnect counters. |
 | `mod_websocket_stream::error` | The playback buffer fills and the oldest audio must be discarded. | Normal channel event data and variables, WebSocket URL, stream settings, error details, queue sizes, dropped audio, timing, and curl result. |
+| `mod_websocket_stream::message` | The WebSocket server sends a JSON message other than `clear`. | Normal channel event data and variables, `WebSocket-Stream-ID`, `WebSocket-Stream-Message-Event` (the message's `event` value), and the original JSON as the body. |
+
+A `closed` transport event adds `WebSocket-Stream-Close-Initiator`: `peer` when
+the WebSocket server closed the connection, or `module` when FreeSWITCH did
+(stream stop or hangup). When the peer closed it, `WebSocket-Stream-Close-Code`
+and `WebSocket-Stream-Close-Text` carry its close frame.
 
 Every module header begins with `WebSocket-Stream-`, except the standard
 FreeSWITCH `Unique-ID`. Common headers include:
@@ -277,8 +358,8 @@ To watch one subclass from an interactive `fs_cli` session:
 /event plain CUSTOM mod_websocket_stream::transport
 ```
 
-Replace the subclass with `mod_websocket_stream::statistics` or
-`mod_websocket_stream::error` as needed. ESL consumers can subscribe to the
+Replace the subclass with `mod_websocket_stream::statistics`,
+`mod_websocket_stream::error`, or `mod_websocket_stream::message` as needed. ESL consumers can subscribe to the
 same `CUSTOM` subclasses.
 
 ## Channel variables and CDRs
