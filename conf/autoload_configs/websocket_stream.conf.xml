@@ -63,6 +63,15 @@
       Header and start-variable names remain limited to 256 bytes. Their values
       remain limited to 4096 bytes. API responses must allow at least 256 bytes.
     -->
+
+    <!--
+      Execute plain-text WebSocket messages as FreeSWITCH API commands. Set to
+      false so the WebSocket server can only send audio, {"event":"clear"},
+      and JSON events (fired as mod_websocket_stream::message). The channel
+      variable websocket_stream_api_commands=false disables them per call.
+      Default: true.
+      <param name="api-commands" value="true"/>
+    -->
   </settings>
 
   <headers/>

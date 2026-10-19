@@ -366,12 +366,9 @@ async def stream_voice_response(
 async def clear_module_playback(
     module_socket: web.WebSocketResponse,
     module_write_lock: asyncio.Lock,
-    channel_uuid: str,
-    stream_id: str,
 ) -> None:
-    command = f"uuid_websocket_stream {channel_uuid} clear {stream_id}"
     async with module_write_lock:
-        await module_socket.send_str(command)
+        await module_socket.send_str(json.dumps({"event": "clear"}))
 
 
 async def conversation_loop(
@@ -382,8 +379,6 @@ async def conversation_loop(
     module_write_lock: asyncio.Lock,
     sample_rate: int,
     connection_name: str,
-    channel_uuid: str,
-    stream_id: str,
 ) -> None:
     messages = [{"role": "system", "content": settings.system_prompt}]
     active_turn: asyncio.Task[None] | None = None
@@ -417,8 +412,6 @@ async def conversation_loop(
         await clear_module_playback(
             module_socket,
             module_write_lock,
-            channel_uuid,
-            stream_id,
         )
 
     try:
@@ -435,8 +428,6 @@ async def conversation_loop(
                 await clear_module_playback(
                     module_socket,
                     module_write_lock,
-                    channel_uuid,
-                    stream_id,
                 )
 
             LOGGER.info("%s caller: %s", connection_name, transcript)
@@ -568,8 +559,6 @@ async def handle_stream(request: web.Request, settings: Settings) -> web.WebSock
                     module_write_lock,
                     sample_rate,
                     connection_name,
-                    channel_uuid,
-                    stream_id,
                 )
             ),
         ]

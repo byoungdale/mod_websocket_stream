@@ -96,8 +96,8 @@ voice-agent channel, continuously play silence so those frames exist:
 
 The server logs each final transcript, generated response, and interruption.
 On a recognized caller utterance it cancels the active LLM/TTS turn and sends
-the module's raw `uuid_websocket_stream ... clear` API command to discard
-queued speech. There is no example-specific command envelope.
+a `{"event":"clear"}` message to discard queued speech, so the example works
+with `api-commands` set to `false`.
 
 Deepgram TTS is requested as headerless PCM. Audio is broken into 20 ms frames
 and paced in real time without catch-up bursts so it does not overflow the
